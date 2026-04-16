@@ -19,6 +19,7 @@ from ..runtime.session_store import SessionStore
 from ..runtime.thinkers import ClaudeAgentThinker, RuleBasedTriageThinker
 from ..runtime.tools import register_github_tools
 from ..runtime.verifier import SchemaSpec
+from ..telemetry.tracing import Tracer
 from .prompts import TriageInputs, build_triage_prompt
 
 
@@ -53,6 +54,7 @@ def run_agentic_triage(
     config: CodexForgeConfig | None = None,
     github_adapter: GitHubAdapter | None = None,
     use_live_model: bool = False,
+    tracer: Tracer | None = None,
 ) -> AgenticTriageResult:
     """Run the agentic triage workflow end-to-end.
 
@@ -109,6 +111,7 @@ def run_agentic_triage(
         session_store=session_store,
         schema=TRIAGE_SCHEMA,
         budget=AgentBudget(max_iterations=5, max_tool_calls=6),
+        tracer=tracer,
     )
 
     prompt = build_triage_prompt(

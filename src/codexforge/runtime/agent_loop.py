@@ -25,6 +25,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol, runtime_checkable
 
+from ..telemetry.tracing import Tracer
 from .memory import MemoryStore, SemanticRecord, WorkingMemory
 from .session_store import SessionStore
 from .verifier import SchemaSpec, VerificationReport, verify_result
@@ -116,6 +117,7 @@ class AgentLoop:
         session_store: SessionStore,
         schema: SchemaSpec,
         budget: AgentBudget | None = None,
+        tracer: Tracer | None = None,
     ) -> None:
         self._thinker = thinker
         self._tools = tools
@@ -123,6 +125,7 @@ class AgentLoop:
         self._session_store = session_store
         self._schema = schema
         self._budget = budget or AgentBudget()
+        self._tracer = tracer or Tracer(None)
 
     def run(
         self,
@@ -159,11 +162,15 @@ class AgentLoop:
         for iteration in range(1, self._budget.max_iterations + 1):
             outcome.iterations = iteration
             rendered = working.render()
-            thought = self._thinker.think(
-                goal=goal,
-                context=rendered,
-                iteration=iteration,
-            )
+            with self._tracer.span(
+                "codexforge.think",
+                {"iteration": iteration, "session_id": session_id},
+            ):
+                thought = self._thinker.think(
+                    goal=goal,
+                    context=rendered,
+                    iteration=iteration,
+                )
             trajectory_entry = {
                 "iteration": iteration,
                 "commentary": thought.commentary,
@@ -204,11 +211,15 @@ class AgentLoop:
                 continue
 
             evidence_corpus = "\n".join(evidence_buffer)
-            report = verify_result(
-                thought.final_result,
-                schema=self._schema,
-                evidence_corpus=evidence_corpus,
-            )
+            with self._tracer.span(
+                "codexforge.verify",
+                {"iteration": iteration, "session_id": session_id},
+            ):
+                report = verify_result(
+                    thought.final_result,
+                    schema=self._schema,
+                    evidence_corpus=evidence_corpus,
+                )
             trajectory_entry["verified"] = report.ok
             trajectory_entry["verification_reason"] = report.reason()
             outcome.trajectory.append(trajectory_entry)
@@ -269,6 +280,11 @@ class AgentLoop:
         return _truncate_tool_payload(tool_result)
 
     def _execute_tool(self, session_id: str, call: ToolCall) -> dict[str, Any]:
+        tracer_ctx = self._tracer.span(
+            "codexforge.tool",
+            {"tool": call.name, "session_id": session_id},
+        )
+        tracer_ctx.__enter__()
         try:
             result = self._tools.execute(call)
         except Exception as exc:  # noqa: BLE001 - we log and surface error
@@ -282,6 +298,7 @@ class AgentLoop:
                 "tool_error",
                 {"tool": call.name, "error": repr(exc)},
             )
+            tracer_ctx.__exit__(type(exc), exc, exc.__traceback__)
             return {"error": repr(exc)}
         self._session_store.record_event(
             session_id,
@@ -293,6 +310,7 @@ class AgentLoop:
             "tool_called",
             {"tool": call.name, "arguments": dict(call.arguments)},
         )
+        tracer_ctx.__exit__(None, None, None)
         return result
 
 

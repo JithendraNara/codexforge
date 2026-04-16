@@ -217,6 +217,24 @@ def agent_review(
     _print_outcome(result.session_id, result.outcome)
 
 
+@app.command(name="mcp-info")
+def mcp_info() -> None:
+    """Show the MCP server metadata for codexforge tools."""
+
+    from .mcp_server import server_metadata
+
+    metadata = server_metadata()
+    console.print(f"[bold]MCP server:[/bold] {metadata['name']} v{metadata['version']}")
+    table = Table(title="Exposed tools", show_lines=True)
+    table.add_column("tool", style="bold")
+    table.add_column("parameters")
+    table.add_column("description")
+    for tool in metadata["tools"]:
+        params = ", ".join(f"{k}:{v}" for k, v in tool["parameters"].items())
+        table.add_row(tool["name"], params, tool["description"])
+    console.print(table)
+
+
 def _print_outcome(session_id: str, outcome: Any) -> None:  # noqa: ANN401
     console.print(
         f"[bold]session:[/bold] {session_id}  [bold]status:[/bold] {outcome.status}"

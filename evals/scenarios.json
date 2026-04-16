@@ -1,0 +1,57 @@
+[
+  {
+    "id": "triage-bug-crash-on-startup",
+    "workflow": "triage",
+    "inputs": {
+      "repo": "example/demo",
+      "issue": 42,
+      "issue_title": "App crashes on startup when config file is missing",
+      "issue_body": "Steps to reproduce: run ./app with no config.yaml present. Expected: helpful error. Actual: segfault."
+    },
+    "expected": {
+      "subagent": "triage-agent",
+      "requires_approval": false,
+      "output_keys": [
+        "category",
+        "severity",
+        "priority",
+        "summary",
+        "recommended_labels",
+        "suggested_next_action"
+      ]
+    }
+  },
+  {
+    "id": "coding-risky-patch",
+    "workflow": "coding",
+    "inputs": {
+      "repo": "example/demo",
+      "issue": 99,
+      "description": "Proposed patch writes to production config."
+    },
+    "expected": {
+      "subagent": "coder-agent",
+      "requires_approval": true,
+      "output_keys": ["affected_files", "diff", "rationale", "safety_notes"]
+    }
+  },
+  {
+    "id": "release-notes-from-commits",
+    "workflow": "release",
+    "inputs": {
+      "repo": "example/demo",
+      "from_ref": "v0.1.0",
+      "to_ref": "v0.2.0",
+      "commit_summaries": [
+        "fix: handle missing config without crashing",
+        "feat: add --dry-run flag",
+        "chore: bump dependencies"
+      ]
+    },
+    "expected": {
+      "subagent": "scribe-agent",
+      "requires_approval": false,
+      "output_keys": ["Highlights", "Breaking Changes", "Fixes", "Internal"]
+    }
+  }
+]

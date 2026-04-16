@@ -1,0 +1,290 @@
+"""Agent loop for codexforge.
+
+The loop turns codexforge from a wrapper into a real agent. It is a
+deliberate, bounded implementation of Plan → Act → Observe → Verify →
+Reflect with:
+
+- **Budget**: hard caps on iterations and total tool calls.
+- **Tool protocol**: every tool is a typed Python callable registered
+  against a name. The agent emits structured tool calls; this module
+  executes them and records the observation.
+- **Verification**: the candidate result must clear :mod:`verifier`
+  checks before the loop terminates.
+- **Reflection**: on verifier failure the agent produces a new plan
+  segment with explicit failure evidence until budget is exhausted.
+
+This implementation is transport-agnostic. It talks to the model
+through a callable ``ThinkerProtocol`` so we can plug the Claude Agent
+SDK, a deterministic fake for tests, or a future model in place
+without changing any of the control logic.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from typing import Any, Callable, Protocol, runtime_checkable
+
+from .memory import MemoryStore, SemanticRecord, WorkingMemory
+from .session_store import SessionStore
+from .verifier import SchemaSpec, VerificationReport, verify_result
+
+
+# --------------------------------------------------------------------- #
+# Protocols and data shapes                                             #
+# --------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCall:
+    """A tool invocation proposed by the thinker."""
+
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class Thought:
+    """A single turn produced by the thinker.
+
+    Exactly one of ``tool_call`` or ``final_result`` is populated.
+    ``commentary`` is free-form reasoning shown to the operator.
+    """
+
+    commentary: str
+    tool_call: ToolCall | None = None
+    final_result: dict[str, Any] | None = None
+
+
+@runtime_checkable
+class ThinkerProtocol(Protocol):
+    """Any component that turns a rendered context into the next step."""
+
+    def think(self, *, goal: str, context: str, iteration: int) -> Thought:
+        ...
+
+
+ToolCallable = Callable[[dict[str, Any]], dict[str, Any]]
+
+
+@dataclass(slots=True)
+class ToolRegistry:
+    tools: dict[str, ToolCallable] = field(default_factory=dict)
+
+    def register(self, name: str, fn: ToolCallable) -> None:
+        if name in self.tools:
+            raise ValueError(f"Tool '{name}' already registered")
+        self.tools[name] = fn
+
+    def execute(self, call: ToolCall) -> dict[str, Any]:
+        fn = self.tools.get(call.name)
+        if fn is None:
+            raise KeyError(f"Unknown tool '{call.name}'")
+        return fn(dict(call.arguments))
+
+
+# --------------------------------------------------------------------- #
+# Loop                                                                  #
+# --------------------------------------------------------------------- #
+
+
+@dataclass(slots=True)
+class AgentBudget:
+    max_iterations: int = 8
+    max_tool_calls: int = 16
+
+
+@dataclass(slots=True)
+class AgentOutcome:
+    status: str
+    result: dict[str, Any] | None
+    verification: VerificationReport | None
+    iterations: int
+    tool_calls: int
+    trajectory: list[dict[str, Any]] = field(default_factory=list)
+
+
+class AgentLoop:
+    """Orchestrates a bounded agent trajectory with verification."""
+
+    def __init__(
+        self,
+        *,
+        thinker: ThinkerProtocol,
+        tools: ToolRegistry,
+        memory: MemoryStore,
+        session_store: SessionStore,
+        schema: SchemaSpec,
+        budget: AgentBudget | None = None,
+    ) -> None:
+        self._thinker = thinker
+        self._tools = tools
+        self._memory = memory
+        self._session_store = session_store
+        self._schema = schema
+        self._budget = budget or AgentBudget()
+
+    def run(
+        self,
+        *,
+        session_id: str,
+        goal: str,
+        evidence_seed: str,
+        semantic_key: tuple[str, str, str] | None = None,
+    ) -> AgentOutcome:
+        """Execute the agent loop against a goal and return the outcome."""
+
+        working = WorkingMemory()
+        working.add("goal", {"text": goal})
+        working.add("seed", {"evidence": evidence_seed})
+
+        if semantic_key is not None:
+            repo, workflow, subject = semantic_key
+            for record in self._memory.recall(repo=repo, workflow=workflow, subject=subject):
+                working.add(
+                    "semantic_recall",
+                    {"summary": record.summary, "tags": list(record.tags)},
+                )
+
+        outcome = AgentOutcome(
+            status="in_progress",
+            result=None,
+            verification=None,
+            iterations=0,
+            tool_calls=0,
+        )
+
+        evidence_buffer = [evidence_seed]
+
+        for iteration in range(1, self._budget.max_iterations + 1):
+            outcome.iterations = iteration
+            rendered = working.render()
+            thought = self._thinker.think(
+                goal=goal,
+                context=rendered,
+                iteration=iteration,
+            )
+            trajectory_entry = {
+                "iteration": iteration,
+                "commentary": thought.commentary,
+            }
+
+            self._session_store.record_event(
+                session_id,
+                "agent_thought",
+                {"iteration": iteration, "commentary": thought.commentary},
+            )
+            working.add("thought", {"commentary": thought.commentary})
+
+            if thought.tool_call is not None:
+                if outcome.tool_calls >= self._budget.max_tool_calls:
+                    trajectory_entry["termination"] = "tool_budget_exhausted"
+                    outcome.trajectory.append(trajectory_entry)
+                    outcome.status = "tool_budget_exhausted"
+                    break
+
+                tool_result = self._execute_tool(session_id, thought.tool_call)
+                outcome.tool_calls += 1
+                working.add(
+                    "tool_result",
+                    {
+                        "tool": thought.tool_call.name,
+                        "arguments": thought.tool_call.arguments,
+                        "result_keys": sorted(tool_result.keys()),
+                    },
+                )
+                evidence_buffer.append(json.dumps(tool_result, default=str))
+                trajectory_entry["tool_call"] = thought.tool_call.name
+                outcome.trajectory.append(trajectory_entry)
+                continue
+
+            if thought.final_result is None:
+                trajectory_entry["termination"] = "no_progress"
+                outcome.trajectory.append(trajectory_entry)
+                continue
+
+            evidence_corpus = "\n".join(evidence_buffer)
+            report = verify_result(
+                thought.final_result,
+                schema=self._schema,
+                evidence_corpus=evidence_corpus,
+            )
+            trajectory_entry["verified"] = report.ok
+            trajectory_entry["verification_reason"] = report.reason()
+            outcome.trajectory.append(trajectory_entry)
+            self._session_store.record_event(
+                session_id,
+                "agent_verification",
+                {"ok": report.ok, "reason": report.reason()},
+            )
+
+            if report.ok:
+                outcome.status = "verified"
+                outcome.result = thought.final_result
+                outcome.verification = report
+                self._memory.record_step(
+                    session_id,
+                    "final_result",
+                    {"result": thought.final_result},
+                )
+                if semantic_key is not None and isinstance(thought.final_result, dict):
+                    repo, workflow, subject = semantic_key
+                    summary = str(thought.final_result.get("summary", ""))[:500]
+                    self._memory.remember(
+                        SemanticRecord(
+                            repo=repo,
+                            workflow=workflow,
+                            subject=subject,
+                            summary=summary,
+                            tags=tuple(
+                                str(label)
+                                for label in thought.final_result.get("recommended_labels", [])
+                            ),
+                        )
+                    )
+                return outcome
+
+            working.add(
+                "reflection",
+                {"failure_reason": report.reason(), "previous_result": thought.final_result},
+            )
+            self._memory.record_step(
+                session_id,
+                "reflection",
+                {"failure_reason": report.reason()},
+            )
+            outcome.status = "reflecting"
+            outcome.verification = report
+
+        if outcome.status == "in_progress":
+            outcome.status = "iteration_budget_exhausted"
+        return outcome
+
+    # ------------------------------------------------------------------ #
+
+    def _execute_tool(self, session_id: str, call: ToolCall) -> dict[str, Any]:
+        try:
+            result = self._tools.execute(call)
+        except Exception as exc:  # noqa: BLE001 - we log and surface error
+            self._session_store.record_event(
+                session_id,
+                "tool_error",
+                {"tool": call.name, "error": repr(exc)},
+            )
+            self._memory.record_step(
+                session_id,
+                "tool_error",
+                {"tool": call.name, "error": repr(exc)},
+            )
+            return {"error": repr(exc)}
+        self._session_store.record_event(
+            session_id,
+            "tool_called",
+            {"tool": call.name, "arguments": dict(call.arguments)},
+        )
+        self._memory.record_step(
+            session_id,
+            "tool_called",
+            {"tool": call.name, "arguments": dict(call.arguments)},
+        )
+        return result

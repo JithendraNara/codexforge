@@ -133,5 +133,30 @@ def eval(  # noqa: A001 - CLI command shadows builtin intentionally
     raise typer.Exit(code=exit_code)
 
 
+@app.command(name="agent-triage")
+def agent_triage(
+    repo: str = typer.Option(..., help="GitHub owner/name, e.g. JithendraNara/example."),
+    issue: int = typer.Option(..., help="Issue number to triage."),
+    live: bool = typer.Option(
+        False,
+        "--live",
+        help="Drive the Claude Agent SDK + MiniMax thinker (requires credentials).",
+    ),
+) -> None:
+    """Run the agentic triage loop end-to-end against a real GitHub issue."""
+
+    from .workflows.agentic_triage import run_agentic_triage
+
+    result = run_agentic_triage(repo=repo, issue_number=issue, use_live_model=live)
+    console.print(
+        f"[bold]session:[/bold] {result.session_id}  [bold]status:[/bold] {result.outcome.status}"
+    )
+    console.print(f"tool_calls={result.outcome.tool_calls} iterations={result.outcome.iterations}")
+    if result.outcome.result:
+        console.print_json(json.dumps(result.outcome.result, default=str))
+    if result.outcome.verification and not result.outcome.verification.ok:
+        console.print(f"[red]verification failed:[/red] {result.outcome.verification.reason()}")
+
+
 if __name__ == "__main__":  # pragma: no cover
     app()

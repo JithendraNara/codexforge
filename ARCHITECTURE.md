@@ -27,6 +27,31 @@ codexforge is a thin, opinionated control plane wrapped around the Claude Agent 
 └─────────────────────────────────────────────┘
 ```
 
+## The agent loop
+
+codexforge is not a thin SDK wrapper. Every workflow runs through a
+bounded **Plan → Act → Observe → Verify → Reflect** loop implemented in
+`runtime/agent_loop.py`:
+
+1. A **thinker** produces the next step as a strict JSON object: either
+   a `tool_call` or a `final_result`.
+2. `ToolRegistry` executes the tool against a real adapter and feeds the
+   observation back into working memory.
+3. When a `final_result` arrives it is validated by
+   `runtime/verifier.py` against a schema, a citation rule, and severity
+   justification checks.
+4. Failed verifications trigger a reflection pass; the loop retries
+   until the iteration or tool-call budget is exhausted.
+5. Successful outputs are persisted to episodic + semantic memory so
+   future runs can recall prior decisions.
+
+Two thinkers ship today:
+
+- `RuleBasedTriageThinker` — deterministic brain used for tests, CI,
+  and reproducible demos.
+- `ClaudeAgentThinker` — wraps the Claude Agent SDK and drives
+  MiniMax-M2.7 via the Anthropic-compatible endpoint for live runs.
+
 ## Runtime components
 
 ### `runtime/client.py`

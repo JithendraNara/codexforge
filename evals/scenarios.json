@@ -53,5 +53,29 @@
       "requires_approval": false,
       "output_keys": ["Highlights", "Breaking Changes", "Fixes", "Internal"]
     }
+  },
+  {
+    "id": "agentic-triage-crash-on-startup",
+    "workflow": "agentic_triage",
+    "inputs": {
+      "repo": "example/demo",
+      "issue": 42,
+      "issue_title": "App crashes on startup when config file is missing",
+      "issue_body": "Steps: run ./app with no config.yaml present. Actual: the binary crashes with a segfault."
+    },
+    "expected": {
+      "subagent": "triage-agent",
+      "requires_approval": false,
+      "min_tool_calls": 1,
+      "require_verified": true,
+      "output_keys": [
+        "category",
+        "severity",
+        "priority",
+        "summary",
+        "recommended_labels",
+        "suggested_next_action"
+      ]
+    }
   }
 ]

@@ -1,0 +1,60 @@
+"""In-memory fakes for offline tests."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Iterable
+
+from codexforge.adapters.github import (
+    GitHubAdapter,
+    GitHubComment,
+    GitHubIssue,
+    RepoSummary,
+)
+
+
+@dataclass(slots=True)
+class FakeGitHubAdapter(GitHubAdapter):
+    """Drop-in replacement for :class:`GitHubAdapter` in tests."""
+
+    issues: dict[tuple[str, int], GitHubIssue] = field(default_factory=dict)
+    comments: dict[tuple[str, int], list[GitHubComment]] = field(default_factory=dict)
+    similar: dict[str, list[GitHubIssue]] = field(default_factory=dict)
+    repos: dict[str, RepoSummary] = field(default_factory=dict)
+    posted: list[tuple[str, int, str]] = field(default_factory=list)
+
+    def __init__(
+        self,
+        *,
+        issues: Iterable[tuple[str, GitHubIssue]] = (),
+        comments: Iterable[tuple[str, int, list[GitHubComment]]] = (),
+        similar: Iterable[tuple[str, list[GitHubIssue]]] = (),
+        repos: Iterable[tuple[str, RepoSummary]] = (),
+    ) -> None:
+        # Do NOT call super().__init__ - we don't need HTTP machinery.
+        self.issues = {(repo, issue.number): issue for repo, issue in issues}
+        self.comments = {(repo, number): value for repo, number, value in comments}
+        self.similar = dict(similar)
+        self.repos = dict(repos)
+        self.posted = []
+
+    def close(self) -> None:  # pragma: no cover - noop
+        return None
+
+    def fetch_repo(self, repo: str) -> RepoSummary:
+        return self.repos[repo]
+
+    def fetch_issue(self, repo: str, number: int) -> GitHubIssue:
+        return self.issues[(repo, number)]
+
+    def fetch_issue_comments(self, repo: str, number: int) -> list[GitHubComment]:
+        return list(self.comments.get((repo, number), []))
+
+    def search_similar_issues(
+        self, repo: str, query: str, *, limit: int = 5
+    ) -> list[GitHubIssue]:
+        return list(self.similar.get(repo, []))[:limit]
+
+    def post_issue_comment(self, repo: str, number: int, body: str) -> GitHubComment:
+        self.posted.append((repo, number, body))
+        return GitHubComment(author="codexforge", body=body, created_at="2026-04-16T00:00:00Z")

@@ -54,6 +54,9 @@ class GitHubPullRequest:
     base_ref: str
     head_ref: str
     url: str
+    changed_files: int = 0
+    additions: int = 0
+    deletions: int = 0
 
 
 @dataclass(slots=True)
@@ -127,6 +130,16 @@ class GitHubAdapter:
         response.raise_for_status()
         return response.json()
 
+    def _get_text(self, path: str, accept: str) -> str:
+        self._sleep_if_exhausted()
+        url = f"{self._base_url}{path}"
+        headers = self._headers()
+        headers["Accept"] = accept
+        response = self._client.get(url, headers=headers)
+        self._update_rate(response)
+        response.raise_for_status()
+        return response.text
+
     def _post(self, path: str, body: dict[str, Any]) -> Any:
         self._sleep_if_exhausted()
         url = f"{self._base_url}{path}"
@@ -165,6 +178,30 @@ class GitHubAdapter:
                 )
             )
         return comments
+
+    def fetch_pull_request(self, repo: str, number: int) -> GitHubPullRequest:
+        data = self._get(f"/repos/{repo}/pulls/{number}")
+        return GitHubPullRequest(
+            number=int(data.get("number", 0)),
+            title=str(data.get("title", "")),
+            body=str(data.get("body") or ""),
+            state=str(data.get("state", "open")),
+            draft=bool(data.get("draft", False)),
+            base_ref=str((data.get("base") or {}).get("ref", "")),
+            head_ref=str((data.get("head") or {}).get("ref", "")),
+            url=str(data.get("html_url", "")),
+            changed_files=int(data.get("changed_files", 0)),
+            additions=int(data.get("additions", 0)),
+            deletions=int(data.get("deletions", 0)),
+        )
+
+    def fetch_pr_diff(self, repo: str, number: int) -> str:
+        """Return the raw unified diff for a pull request."""
+
+        return self._get_text(
+            f"/repos/{repo}/pulls/{number}",
+            accept="application/vnd.github.v3.diff",
+        )
 
     def search_similar_issues(
         self,

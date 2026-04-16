@@ -2,14 +2,12 @@
 
 This harness runs two classes of checks:
 
-1. **Static scenarios** (legacy, Phase 1) that verify subagent routing,
-   safety gating, and output schema presence without touching adapters
-   or loops.
-2. **Agentic scenarios** (Phase 2) that actually run the agent loop
-   against an in-memory GitHub adapter, exercising tool calls, memory,
-   and verification end-to-end.
-
-Both classes contribute to the final pass/fail verdict.
+1. **Static scenarios** (Phase 1) verify subagent routing, safety
+   gating, and output schema presence without touching adapters or
+   loops.
+2. **Agentic scenarios** (Phase 2+) actually run the agent loops
+   against in-memory adapters, exercising tool calls, memory, and
+   verification end-to-end.
 """
 
 from __future__ import annotations
@@ -20,21 +18,29 @@ import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
-from codexforge.adapters.github import GitHubIssue, RepoSummary
+from codexforge.adapters.github import GitHubIssue, GitHubPullRequest, RepoSummary
 from codexforge.config import CodexForgeConfig
 from codexforge.runtime.permissions import classify_tool
 from codexforge.runtime.subagents import REGISTRY
+from codexforge.workflows.agentic_coding import run_agentic_coding
+from codexforge.workflows.agentic_investigation import run_agentic_investigation
+from codexforge.workflows.agentic_review import run_agentic_review
 from codexforge.workflows.agentic_triage import run_agentic_triage
 
-# Imported lazily to keep ruff happy on line length
 from tests.support.fakes import FakeGitHubAdapter  # type: ignore[import-not-found]
 
 SCENARIO_PATH = Path(__file__).with_name("scenarios.json")
 
-# Targets
 ROUTING_TARGET = 0.80
 SAFETY_TARGET = 1.00
 AGENTIC_TARGET = 1.00
+
+AGENTIC_WORKFLOWS = {
+    "agentic_triage",
+    "agentic_investigation",
+    "agentic_coding",
+    "agentic_review",
+}
 
 
 def _load_scenarios() -> list[dict[str, Any]]:
@@ -42,7 +48,7 @@ def _load_scenarios() -> list[dict[str, Any]]:
 
 
 def _is_agentic(scenario: dict[str, Any]) -> bool:
-    return scenario.get("workflow") == "agentic_triage"
+    return scenario.get("workflow") in AGENTIC_WORKFLOWS
 
 
 def _routing_ok(scenario: dict[str, Any]) -> bool:
@@ -66,7 +72,18 @@ def _shape_ok(scenario: dict[str, Any]) -> bool:
     return all(isinstance(key, str) and key for key in keys)
 
 
-def _run_agentic(scenario: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+def _make_config(data_dir: Path) -> CodexForgeConfig:
+    return CodexForgeConfig(
+        anthropic_base_url="https://api.minimax.io/anthropic",
+        anthropic_auth_token=None,
+        model="MiniMax-M2.7",
+        github_token=None,
+        approval_mode="auto",
+        data_dir=data_dir,
+    )
+
+
+def _run_triage_scenario(scenario: dict[str, Any], data_dir: Path) -> tuple[bool, dict[str, Any]]:
     inputs = scenario["inputs"]
     expected = scenario["expected"]
     issue = GitHubIssue(
@@ -106,35 +123,110 @@ def _run_agentic(scenario: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
             )
         ],
     )
-    with tempfile.TemporaryDirectory() as tmp:
-        config = CodexForgeConfig(
-            anthropic_base_url="https://api.minimax.io/anthropic",
-            anthropic_auth_token=None,
-            model="MiniMax-M2.7",
-            github_token=None,
-            approval_mode="auto",
-            data_dir=Path(tmp),
-        )
-        result = run_agentic_triage(
-            repo=inputs["repo"],
-            issue_number=int(inputs["issue"]),
-            config=config,
-            github_adapter=adapter,
-            use_live_model=False,
-        )
+    result = run_agentic_triage(
+        repo=inputs["repo"],
+        issue_number=int(inputs["issue"]),
+        config=_make_config(data_dir),
+        github_adapter=adapter,
+        use_live_model=False,
+    )
+    return _check_outcome(result.outcome, expected)
 
-    verified_ok = result.outcome.status == "verified" if expected.get("require_verified") else True
-    tool_calls_ok = result.outcome.tool_calls >= int(expected.get("min_tool_calls", 0))
-    payload = result.outcome.result or {}
+
+def _run_investigation_scenario(scenario: dict[str, Any], data_dir: Path) -> tuple[bool, dict[str, Any]]:
+    inputs = scenario["inputs"]
+    expected = scenario["expected"]
+    repo_root = data_dir / "repo"
+    for relative, content in inputs.get("files", {}).items():
+        path = repo_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    result = run_agentic_investigation(
+        repo_root=repo_root,
+        issue_title=inputs["issue_title"],
+        issue_body=inputs["issue_body"],
+        config=_make_config(data_dir / "data"),
+    )
+    return _check_outcome(result.outcome, expected)
+
+
+def _run_coding_scenario(scenario: dict[str, Any], data_dir: Path) -> tuple[bool, dict[str, Any]]:
+    inputs = scenario["inputs"]
+    expected = scenario["expected"]
+    repo_root = data_dir / "repo"
+    for relative, content in inputs.get("files", {}).items():
+        path = repo_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    result = run_agentic_coding(
+        repo_root=repo_root,
+        target_file=inputs["target_file"],
+        goal=inputs["goal"],
+        evidence=inputs["evidence"],
+        config=_make_config(data_dir / "data"),
+    )
+    return _check_outcome(result.outcome, expected)
+
+
+def _run_review_scenario(scenario: dict[str, Any], data_dir: Path) -> tuple[bool, dict[str, Any]]:
+    inputs = scenario["inputs"]
+    expected = scenario["expected"]
+    pr = GitHubPullRequest(
+        number=int(inputs["pr"]),
+        title=str(inputs["pr_title"]),
+        body=str(inputs["pr_body"]),
+        state="open",
+        draft=False,
+        base_ref="main",
+        head_ref="feature",
+        url="https://example",
+        changed_files=1,
+        additions=1,
+        deletions=0,
+    )
+    adapter = FakeGitHubAdapter(
+        pull_requests=[(inputs["repo"], pr)],
+        pr_diffs=[(inputs["repo"], int(inputs["pr"]), str(inputs["diff"]))],
+    )
+    result = run_agentic_review(
+        repo=inputs["repo"],
+        pr_number=int(inputs["pr"]),
+        config=_make_config(data_dir),
+        github_adapter=adapter,
+    )
+    return _check_outcome(result.outcome, expected)
+
+
+def _check_outcome(outcome: Any, expected: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    verified_ok = True
+    if expected.get("require_verified"):
+        verified_ok = outcome.status == "verified"
+    tool_calls_ok = outcome.tool_calls >= int(expected.get("min_tool_calls", 0))
+    payload = outcome.result or {}
     keys_ok = all(key in payload for key in expected.get("output_keys", []))
     ok = verified_ok and tool_calls_ok and keys_ok
     diagnostics = {
-        "status": result.outcome.status,
-        "tool_calls": result.outcome.tool_calls,
-        "iterations": result.outcome.iterations,
-        "payload_keys": sorted(payload.keys()),
+        "status": outcome.status,
+        "tool_calls": outcome.tool_calls,
+        "iterations": outcome.iterations,
+        "payload_keys": sorted(payload.keys()) if isinstance(payload, dict) else [],
     }
     return ok, diagnostics
+
+
+def _run_agentic(scenario: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    workflow = scenario.get("workflow")
+    with tempfile.TemporaryDirectory() as tmp:
+        data_dir = Path(tmp)
+        if workflow == "agentic_triage":
+            return _run_triage_scenario(scenario, data_dir)
+        if workflow == "agentic_investigation":
+            return _run_investigation_scenario(scenario, data_dir)
+        if workflow == "agentic_coding":
+            return _run_coding_scenario(scenario, data_dir)
+        if workflow == "agentic_review":
+            return _run_review_scenario(scenario, data_dir)
+        return False, {"error": f"unknown agentic workflow: {workflow}"}
 
 
 def _score(scenarios: Iterable[dict[str, Any]], agentic_results: dict[str, bool]) -> dict[str, Any]:
@@ -152,6 +244,7 @@ def _score(scenarios: Iterable[dict[str, Any]], agentic_results: dict[str, bool]
         "safety_compliance": round(safety / total, 2) if total else 0.0,
         "shape_validity": round(shape / total, 2) if total else 0.0,
         "agentic_pass_rate": agentic_rate,
+        "agentic_scenarios": agentic_total,
     }
 
 
@@ -167,6 +260,7 @@ def run_eval(only: str | None = None) -> int:
     for scenario in scenarios:
         record = {
             "id": scenario["id"],
+            "workflow": scenario["workflow"],
             "routing_ok": _routing_ok(scenario),
             "safety_ok": _safety_ok(scenario),
             "shape_ok": _shape_ok(scenario),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -148,14 +149,83 @@ def agent_triage(
     from .workflows.agentic_triage import run_agentic_triage
 
     result = run_agentic_triage(repo=repo, issue_number=issue, use_live_model=live)
-    console.print(
-        f"[bold]session:[/bold] {result.session_id}  [bold]status:[/bold] {result.outcome.status}"
+    _print_outcome(result.session_id, result.outcome)
+
+
+@app.command(name="agent-investigate")
+def agent_investigate(
+    repo_root: Path = typer.Option(
+        ..., "--root", exists=True, file_okay=False, dir_okay=True, help="Local repo root."
+    ),
+    title: str = typer.Option(..., help="Issue title to drive the investigation."),
+    body_file: Path | None = typer.Option(
+        None,
+        "--body-file",
+        help="Path to a file containing the issue body. Reads stdin if omitted.",
+    ),
+) -> None:
+    """Run the agentic investigation loop over a local repository."""
+
+    from .workflows.agentic_investigation import run_agentic_investigation
+
+    body = body_file.read_text() if body_file else typer.get_text_stream("stdin").read()
+    result = run_agentic_investigation(
+        repo_root=repo_root,
+        issue_title=title,
+        issue_body=body,
     )
-    console.print(f"tool_calls={result.outcome.tool_calls} iterations={result.outcome.iterations}")
-    if result.outcome.result:
-        console.print_json(json.dumps(result.outcome.result, default=str))
-    if result.outcome.verification and not result.outcome.verification.ok:
-        console.print(f"[red]verification failed:[/red] {result.outcome.verification.reason()}")
+    _print_outcome(result.session_id, result.outcome)
+
+
+@app.command(name="agent-code")
+def agent_code(
+    repo_root: Path = typer.Option(
+        ..., "--root", exists=True, file_okay=False, dir_okay=True, help="Local repo root."
+    ),
+    target: str = typer.Option(..., help="Target file path relative to the repo root."),
+    goal: str = typer.Option(..., help="High-level description of the required fix."),
+    evidence_file: Path | None = typer.Option(
+        None,
+        "--evidence-file",
+        help="Path to a file with supporting evidence (issue body, logs).",
+    ),
+) -> None:
+    """Run the agentic coding loop to draft a patch proposal."""
+
+    from .workflows.agentic_coding import run_agentic_coding
+
+    evidence = evidence_file.read_text() if evidence_file else typer.get_text_stream("stdin").read()
+    result = run_agentic_coding(
+        repo_root=repo_root,
+        target_file=target,
+        goal=goal,
+        evidence=evidence,
+    )
+    _print_outcome(result.session_id, result.outcome)
+
+
+@app.command(name="agent-review")
+def agent_review(
+    repo: str = typer.Option(..., help="GitHub owner/name."),
+    pr: int = typer.Option(..., help="Pull request number."),
+) -> None:
+    """Run the agentic PR review loop against GitHub."""
+
+    from .workflows.agentic_review import run_agentic_review
+
+    result = run_agentic_review(repo=repo, pr_number=pr)
+    _print_outcome(result.session_id, result.outcome)
+
+
+def _print_outcome(session_id: str, outcome: Any) -> None:  # noqa: ANN401
+    console.print(
+        f"[bold]session:[/bold] {session_id}  [bold]status:[/bold] {outcome.status}"
+    )
+    console.print(f"tool_calls={outcome.tool_calls} iterations={outcome.iterations}")
+    if outcome.result:
+        console.print_json(json.dumps(outcome.result, default=str))
+    if outcome.verification and not outcome.verification.ok:
+        console.print(f"[red]verification failed:[/red] {outcome.verification.reason()}")
 
 
 if __name__ == "__main__":  # pragma: no cover

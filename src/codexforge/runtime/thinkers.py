@@ -25,6 +25,7 @@ import textwrap
 from dataclasses import dataclass
 from typing import Any
 
+from ..adapters.patch import parse_unified_diff
 from .agent_loop import Thought, ToolCall
 
 
@@ -209,6 +210,283 @@ def _suggested_action(category: str, similar_count: int) -> str:
     if category == "feature":
         return "needs_design"
     return "ready"
+
+
+# --------------------------------------------------------------------- #
+# Deterministic investigation thinker                                   #
+# --------------------------------------------------------------------- #
+
+
+@dataclass(slots=True)
+class RuleBasedInvestigatorThinker:
+    """Offline investigator brain used for tests and deterministic evals.
+
+    Iteration plan:
+    1. List the repo root to understand layout.
+    2. Search for a hint phrase derived from the issue body.
+    3. Emit a structured reproduction plan with gathered evidence.
+    """
+
+    hint_phrase: str
+
+    def think(self, *, goal: str, context: str, iteration: int) -> Thought:
+        if iteration == 1:
+            return Thought(
+                commentary="Survey the sandbox root before diving in.",
+                tool_call=ToolCall(name="list_dir", arguments={"path": "."}),
+            )
+        if iteration == 2:
+            return Thought(
+                commentary=(
+                    f"Search the repo for the hint phrase {self.hint_phrase!r} so we can"
+                    " anchor the reproduction plan to real code."
+                ),
+                tool_call=ToolCall(
+                    name="search_text",
+                    arguments={"query": self.hint_phrase, "max_matches": 10},
+                ),
+            )
+
+        matches = _parse_search_matches(context)
+        repro_steps = _build_repro_steps(self.hint_phrase, matches)
+        evidence = _build_evidence(matches)
+        hypotheses = _build_hypotheses(self.hint_phrase, matches)
+
+        final = {
+            "reproduced": False,
+            "steps": repro_steps,
+            "evidence": evidence,
+            "hypotheses": hypotheses,
+        }
+        commentary = (
+            f"Plan ready. Collected {len(evidence)} evidence snippets and"
+            f" {len(hypotheses)} hypotheses."
+        )
+        return Thought(commentary=commentary, final_result=final)
+
+
+def _parse_search_matches(context: str) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for line in context.splitlines():
+        if "tool_result" not in line or "search_text" not in line:
+            continue
+        blob_start = line.find("{")
+        if blob_start == -1:
+            continue
+        try:
+            payload = json.loads(line[blob_start:])
+        except json.JSONDecodeError:
+            continue
+        data = payload.get("data") or payload
+        if isinstance(data, dict) and isinstance(data.get("matches"), list):
+            matches.extend(data["matches"])
+    return matches
+
+
+def _build_repro_steps(hint: str, matches: list[dict[str, Any]]) -> list[str]:
+    steps = [
+        "Clone the repository to a clean working directory.",
+        "Install dependencies exactly as described in the README.",
+    ]
+    if matches:
+        steps.append(
+            f"Open {matches[0].get('path', 'the relevant file')} to inspect the context"
+            f" around the hint phrase '{hint}'."
+        )
+    steps.append("Run the reported command and capture stdout, stderr, and exit code.")
+    return steps
+
+
+def _build_evidence(matches: list[dict[str, Any]]) -> list[str]:
+    evidence: list[str] = []
+    for match in matches[:3]:
+        evidence.append(
+            f"{match.get('path', '<unknown>')}:{match.get('line', 0)} — {match.get('text', '')}"
+        )
+    return evidence
+
+
+def _build_hypotheses(hint: str, matches: list[dict[str, Any]]) -> list[dict[str, str]]:
+    if matches:
+        return [
+            {
+                "statement": f"Failure is related to code handling '{hint}'",
+                "support": "matched source locations",
+            }
+        ]
+    return [
+        {
+            "statement": f"No direct references to '{hint}' were found",
+            "support": "search yielded zero matches",
+        }
+    ]
+
+
+# --------------------------------------------------------------------- #
+# Deterministic coder thinker                                           #
+# --------------------------------------------------------------------- #
+
+
+@dataclass(slots=True)
+class RuleBasedCoderThinker:
+    """Offline coder brain that drafts a minimal patch + rationale."""
+
+    target_file: str
+    safe_addition: str = "# TODO(codexforge): add guard for missing config file."
+
+    def think(self, *, goal: str, context: str, iteration: int) -> Thought:
+        if iteration == 1:
+            return Thought(
+                commentary="Read the target file to anchor the proposal in real content.",
+                tool_call=ToolCall(
+                    name="read_file", arguments={"path": self.target_file}
+                ),
+            )
+        if iteration == 2:
+            return Thought(
+                commentary="Validate the proposed patch before emitting a final result.",
+                tool_call=ToolCall(
+                    name="validate_patch",
+                    arguments={
+                        "diff": _make_diff(self.target_file, self.safe_addition),
+                        "allowed_paths": [self.target_file],
+                    },
+                ),
+            )
+
+        final = {
+            "affected_files": [self.target_file],
+            "diff": _make_diff(self.target_file, self.safe_addition),
+            "rationale": (
+                f"Add a guarded TODO note to {self.target_file} to capture the"
+                " required fix without changing runtime behaviour."
+            ),
+            "tests_to_add": [],
+            "safety_notes": [
+                "Patch only adds a comment and is reversible by removing the line.",
+            ],
+        }
+        return Thought(
+            commentary="Patch validated locally; return the typed proposal.",
+            final_result=final,
+        )
+
+
+def _make_diff(target_file: str, line: str) -> str:
+    return textwrap.dedent(
+        f"""\
+        --- a/{target_file}
+        +++ b/{target_file}
+        @@ -1,1 +1,2 @@
+        +{line}
+         # existing first line
+        """
+    )
+
+
+# --------------------------------------------------------------------- #
+# Deterministic reviewer thinker                                        #
+# --------------------------------------------------------------------- #
+
+
+@dataclass(slots=True)
+class RuleBasedReviewerThinker:
+    """Offline reviewer brain that produces structured, line-anchored feedback."""
+
+    repo: str
+    pr_number: int
+
+    def think(self, *, goal: str, context: str, iteration: int) -> Thought:
+        if iteration == 1:
+            return Thought(
+                commentary="Fetch the PR metadata first.",
+                tool_call=ToolCall(
+                    name="fetch_pull_request",
+                    arguments={"repo": self.repo, "number": self.pr_number},
+                ),
+            )
+        if iteration == 2:
+            return Thought(
+                commentary="Fetch and analyse the unified diff before judging.",
+                tool_call=ToolCall(
+                    name="fetch_pr_diff",
+                    arguments={"repo": self.repo, "number": self.pr_number},
+                ),
+            )
+
+        diff_text = _parse_pr_diff_from_context(context)
+        pr_info = _parse_pr_metadata_from_context(context)
+        feedback: list[dict[str, Any]] = []
+        blocking: list[str] = []
+
+        if not diff_text.strip():
+            blocking.append("No diff fetched; cannot review.")
+        parsed = parse_unified_diff(diff_text) if diff_text else None
+
+        if parsed is not None:
+            if parsed.total_hunks() == 0:
+                blocking.append("Diff contains no hunks.")
+            for file in parsed.files:
+                feedback.append(
+                    {
+                        "file": file.new_path,
+                        "line": file.hunks[0].new_start if file.hunks else 1,
+                        "comment": "Review needed: ensure tests cover this change.",
+                    }
+                )
+
+        verdict = "accept"
+        if blocking:
+            verdict = "reject"
+        elif any(item["comment"].startswith("Review needed") for item in feedback):
+            verdict = "revise"
+
+        final = {
+            "verdict": verdict,
+            "feedback": feedback,
+            "blocking_issues": blocking,
+            "pr_summary": pr_info,
+        }
+        return Thought(
+            commentary=f"Review complete with verdict={verdict}.",
+            final_result=final,
+        )
+
+
+def _parse_pr_metadata_from_context(context: str) -> dict[str, Any]:
+    for line in context.splitlines():
+        if "tool_result" not in line or "fetch_pull_request" not in line:
+            continue
+        blob_start = line.find("{")
+        if blob_start == -1:
+            continue
+        try:
+            payload = json.loads(line[blob_start:])
+        except json.JSONDecodeError:
+            continue
+        data = payload.get("data") or payload
+        if isinstance(data, dict):
+            pr = data.get("pull_request")
+            if isinstance(pr, dict):
+                return pr
+    return {}
+
+
+def _parse_pr_diff_from_context(context: str) -> str:
+    for line in context.splitlines():
+        if "tool_result" not in line or "fetch_pr_diff" not in line:
+            continue
+        blob_start = line.find("{")
+        if blob_start == -1:
+            continue
+        try:
+            payload = json.loads(line[blob_start:])
+        except json.JSONDecodeError:
+            continue
+        data = payload.get("data") or payload
+        if isinstance(data, dict) and isinstance(data.get("diff"), str):
+            return str(data["diff"])
+    return ""
 
 
 # --------------------------------------------------------------------- #

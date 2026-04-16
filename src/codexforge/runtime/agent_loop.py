@@ -190,7 +190,7 @@ class AgentLoop:
                     {
                         "tool": thought.tool_call.name,
                         "arguments": thought.tool_call.arguments,
-                        "result_keys": sorted(tool_result.keys()),
+                        "data": _truncate_tool_payload(tool_result),
                     },
                 )
                 evidence_buffer.append(json.dumps(tool_result, default=str))
@@ -262,6 +262,12 @@ class AgentLoop:
 
     # ------------------------------------------------------------------ #
 
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _truncate_tool_payload_static(tool_result: dict[str, Any]) -> dict[str, Any]:
+        return _truncate_tool_payload(tool_result)
+
     def _execute_tool(self, session_id: str, call: ToolCall) -> dict[str, Any]:
         try:
             result = self._tools.execute(call)
@@ -288,3 +294,27 @@ class AgentLoop:
             {"tool": call.name, "arguments": dict(call.arguments)},
         )
         return result
+
+
+def _truncate_tool_payload(payload: dict[str, Any], *, max_chars: int = 1800) -> dict[str, Any]:
+    """Return a copy of ``payload`` safe for inclusion in working memory.
+
+    The working memory must be small enough to stay cheap to pass back
+    to the thinker, but must preserve enough structure for the thinker
+    to reason. We copy scalar keys verbatim and truncate long string
+    values. Nested dicts and lists are kept intact but their string
+    leaves are shortened.
+    """
+
+    def _truncate_value(value: Any) -> Any:
+        if isinstance(value, str):
+            if len(value) <= max_chars:
+                return value
+            return value[:max_chars] + "…"
+        if isinstance(value, list):
+            return [_truncate_value(item) for item in value[:10]]
+        if isinstance(value, dict):
+            return {key: _truncate_value(val) for key, val in value.items()}
+        return value
+
+    return {key: _truncate_value(val) for key, val in payload.items()}

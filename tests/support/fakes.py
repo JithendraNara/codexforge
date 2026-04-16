@@ -9,6 +9,7 @@ from codexforge.adapters.github import (
     GitHubAdapter,
     GitHubComment,
     GitHubIssue,
+    GitHubPullRequest,
     RepoSummary,
 )
 
@@ -23,6 +24,9 @@ class FakeGitHubAdapter(GitHubAdapter):
     repos: dict[str, RepoSummary] = field(default_factory=dict)
     posted: list[tuple[str, int, str]] = field(default_factory=list)
 
+    pull_requests: dict[tuple[str, int], GitHubPullRequest] = field(default_factory=dict)
+    pr_diffs: dict[tuple[str, int], str] = field(default_factory=dict)
+
     def __init__(
         self,
         *,
@@ -30,12 +34,16 @@ class FakeGitHubAdapter(GitHubAdapter):
         comments: Iterable[tuple[str, int, list[GitHubComment]]] = (),
         similar: Iterable[tuple[str, list[GitHubIssue]]] = (),
         repos: Iterable[tuple[str, RepoSummary]] = (),
+        pull_requests: Iterable[tuple[str, GitHubPullRequest]] = (),
+        pr_diffs: Iterable[tuple[str, int, str]] = (),
     ) -> None:
         # Do NOT call super().__init__ - we don't need HTTP machinery.
         self.issues = {(repo, issue.number): issue for repo, issue in issues}
         self.comments = {(repo, number): value for repo, number, value in comments}
         self.similar = dict(similar)
         self.repos = dict(repos)
+        self.pull_requests = {(repo, pr.number): pr for repo, pr in pull_requests}
+        self.pr_diffs = {(repo, number): diff for repo, number, diff in pr_diffs}
         self.posted = []
 
     def close(self) -> None:  # pragma: no cover - noop
@@ -58,3 +66,9 @@ class FakeGitHubAdapter(GitHubAdapter):
     def post_issue_comment(self, repo: str, number: int, body: str) -> GitHubComment:
         self.posted.append((repo, number, body))
         return GitHubComment(author="codexforge", body=body, created_at="2026-04-16T00:00:00Z")
+
+    def fetch_pull_request(self, repo: str, number: int) -> GitHubPullRequest:
+        return self.pull_requests[(repo, number)]
+
+    def fetch_pr_diff(self, repo: str, number: int) -> str:
+        return self.pr_diffs[(repo, number)]
